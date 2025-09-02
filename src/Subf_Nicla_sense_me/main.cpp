@@ -1,4 +1,4 @@
-#include "Arduino_BHY2.h"
+#include <Arduino_BHY2.h>
 
 SensorQuaternion quat(SENSOR_ID_RV);
 
