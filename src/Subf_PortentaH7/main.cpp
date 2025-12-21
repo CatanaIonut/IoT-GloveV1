@@ -1,163 +1,215 @@
+#include <Arduino.h>
+#include <SPI.h>
 #include <ArduinoBLE.h>
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include <Fonts/FreeSansBold24pt7b.h>
-#include "connect.h"
+#include "connect.h"   // WiFi, NTP, MQTT, sendData()
+
+// ==== TFT pins ====
 #define TFT_DC   6
 #define TFT_CS   7
 #define TFT_RST  8
-
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 
-// BLE Service + Characteristic
-BLEService textService("180C");
-BLECharacteristic textCharacteristic("2A56", BLEWrite, 50);
+// ==== UUID-urile serviciului/characteristicii de pe Nicla ====
+static const char* SVC_RPY = "12345678-1234-5678-1234-56789abcdef0";
+static const char* CHR_RPY = "12345678-1234-5678-1234-56789abcdef1";
 
-String textLog = "";   // aici stocăm toate caracterele trimise
+// ==== BLE Central state ====
+BLEDevice nicla;
+BLECharacteristic rpyChr;
 
-// ================= HELPER =================
-void drawRoundBoxedText(String text, int16_t x, int16_t y, int16_t w, int16_t h,
-                        uint16_t textColor, uint16_t bgColor,
-                        const GFXfont *font = NULL, uint8_t textSize = 1) {
-  // fundal rotunjit
-  tft.fillRoundRect(x, y, w, h, 10, bgColor);
-  tft.drawRoundRect(x, y, w, h, 10, ILI9341_WHITE);
- 
-  // text centrat
-  if (font != NULL) {
-    tft.setFont(font);
-  } else {
-    tft.setFont();
-  }
-  tft.setTextSize(textSize);
-  tft.setTextColor(textColor, bgColor);
+bool rpyConnected = false;
+unsigned long lastDraw = 0;
 
-  int16_t x1, y1;
-  uint16_t tw, th;
-  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
-
-  int tx = x + (w - tw) / 2;
-  int ty = y + (h + th) / 2;
-
-  tft.setCursor(tx, ty);
-  tft.print(text);
-
-  tft.setFont(); // reset
-}
-
-// ================= UI SCREENS =================
-void showStartupScreen() {
-  tft.fillScreen(ILI9341_BLACK);
-  drawRoundBoxedText("Astept BLE...", 20, 60, tft.width() - 40, 60,
-                     ILI9341_WHITE, ILI9341_BLUE, NULL, 2);
-}
-
-void showConnectedScreen() {
-  tft.fillScreen(ILI9341_BLACK);
-  drawRoundBoxedText("Conectat!", 20, 60, tft.width() - 40, 60,
-                     ILI9341_WHITE, ILI9341_GREEN, NULL, 2);
-}
-
-void showPromptScreen() {
-  tft.fillScreen(ILI9341_BLACK);
-  drawRoundBoxedText("Trimiteti un caracter:", 20, 40, tft.width() - 40, 50,
-                     ILI9341_WHITE, ILI9341_BLUE, NULL, 2);
-
-  // caseta log jos (gri închis)
-  tft.fillRoundRect(10, tft.height() - 50, tft.width() - 20, 40, 8, ILI9341_DARKGREY);
-  tft.drawRoundRect(10, tft.height() - 50, tft.width() - 20, 40, 8, ILI9341_WHITE);
-}
-
-void showMainChar(String ch) {
-  int boxH = tft.height() / 2;
-  drawRoundBoxedText(ch, 20, (tft.height() - boxH) / 2, tft.width() - 40, boxH,
-                     ILI9341_WHITE, ILI9341_NAVY, &FreeSansBold24pt7b, 1);
-}
-
-void updateLogBox() {
-  int boxY = tft.height() - 50;
-  int boxH = 40;
-  int boxW = tft.width() - 20;
-
-  // reumple caseta log cu gri închis
-  tft.fillRoundRect(10, boxY, boxW, boxH, 8, ILI9341_DARKGREY);
-  tft.drawRoundRect(10, boxY, boxW, boxH, 8, ILI9341_WHITE);
-
-  // text alb mic
-  tft.setFont();
+// ====== UI helpers ======
+static void drawHeader(const char* status, uint16_t color) {
+  tft.fillRect(0, 0, tft.width(), 30, color);
   tft.setTextSize(2);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_DARKGREY);
-  tft.setCursor(15, boxY + 25);
+  tft.setTextColor(ILI9341_BLACK, color);
+  tft.setCursor(8, 7);
+  tft.print(status);
+}
 
-  tft.print(textLog);
+static void drawSearchingScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  drawHeader("Caut NiclaME_RPY...", ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setCursor(16, 60);
+  tft.print("Porneste Nicla si BLE");
+}
+
+static void drawConnectedScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  drawHeader("Conectat la Nicla", ILI9341_GREEN);
+
+  // etichete
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
+  tft.setCursor(16, 60);  tft.print("Roll :");
+  tft.setCursor(16, 100); tft.print("Pitch:");
+  tft.setCursor(16, 140); tft.print("Yaw  :");
+
+  // casete valori
+  tft.drawRoundRect(110, 48, 190, 32, 6, ILI9341_WHITE);
+  tft.drawRoundRect(110, 88, 190, 32, 6, ILI9341_WHITE);
+  tft.drawRoundRect(110, 128, 190, 32, 6, ILI9341_WHITE);
+}
+
+static void drawRPY(float r, float p, float y) {
+  auto drawBox = [&](int y0, float v) {
+    tft.fillRect(112, y0+2, 186, 28, ILI9341_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%4.0f deg", v);   // tu trimiți întregi ca float
+    tft.setCursor(120, y0+10);
+    tft.print(buf);
+  };
+  drawBox(48,  r);
+  drawBox(88,  p);
+  drawBox(128, y);
+}
+
+static void mqttPublishRPY(float r, float p, float y) {
+  
+  String topic1 = String("tenants/") + "beta" + "/glove/PortentaH7/Roll";
+  String topic2 = String("tenants/") + "beta" + "/glove/PortentaH7/Pitch";
+  String topic3 = String("tenants/") + "beta" + "/glove/PortentaH7/Yaw";
+
+  sendData(mqtt, topic1.c_str(), "roll",  r, "deg");
+  sendData(mqtt, topic2.c_str(), "pitch", p, "deg");
+  sendData(mqtt, topic3.c_str(), "yaw",   y, "deg");
+}
+
+// ====== BLE: scan & connect ======
+static void scanAndConnectNicla() {
+  if (rpyConnected) return;
+
+  BLEDevice dev = BLE.available();         // valabil cât timp scanăm
+  if (!dev) return;
+
+  // debug: vezi ce găsește
+  Serial.print("Gasit: ");
+  if (dev.hasLocalName()) Serial.println(dev.localName());
+  else Serial.println("(fara nume)");
+
+  bool match = (dev.hasLocalName() && String(dev.localName()) == "NiclaME_RPY");
+  if (!match) return;
+
+  Serial.println(">> Nicla gasita, incerc conectare...");
+  BLE.stopScan();
+
+  if (!dev.connect()) {
+    Serial.println("Conectare esuata!");
+    BLE.scan();
+    return;
+  }
+
+  Serial.println("Conectat, descopar atribute...");
+  if (!dev.discoverAttributes()) {
+    Serial.println("Nu pot descoperi atribute!");
+    dev.disconnect();
+    BLE.scan();
+    return;
+  }
+
+  rpyChr = dev.characteristic(CHR_RPY);
+  if (!rpyChr) {
+    Serial.println("Caracteristica lipsa!");
+    dev.disconnect(); BLE.scan(); return;
+  }
+  if (!rpyChr.canSubscribe()) {
+    Serial.println("Caracteristica nu permite subscribe!");
+    dev.disconnect(); BLE.scan(); return;
+  }
+  if (!rpyChr.subscribe()) {
+    Serial.println("Subscribe esuat!");
+    dev.disconnect(); BLE.scan(); return;
+  }
+
+  nicla = dev;
+  rpyConnected = true;
+  Serial.println("Conectat la NiclaME_RPY");
+  drawConnectedScreen();
 }
 
 // ================= SETUP =================
 void setup() {
-  delay(1000);
   Serial.begin(115200);
+  delay(200);
+
+  // --- WiFi + timp + MQTT (NE-MODIFICATE) ---
   setupWiFi();
   setupTime();
-  while (!Serial);
+  setupMQTT();
+  connectMQTT();
 
-  delay(1000);
-  Serial.println(nowISO8601());
-  delay(5000);
-  
+  // --- TFT ---
   tft.begin();
   tft.setRotation(1);
+  drawSearchingScreen();
 
-  showStartupScreen();
-
+  // --- BLE Central ---
   if (!BLE.begin()) {
     Serial.println("Eroare BLE!");
-    while (1);
+    while (1) {}
   }
-
-  BLE.setLocalName("PortentaH7_BT");
-  BLE.setAdvertisedService(textService);
-  textService.addCharacteristic(textCharacteristic);
-  BLE.addService(textService);
-
-  BLE.advertise();
-  Serial.println("BLE Pornit!");
+  Serial.println("Scanez pentru NiclaME_RPY...");
+  BLE.scan();   // rezultatele se citesc cu BLE.available() în loop
 }
 
 // ================= LOOP =================
 void loop() {
-  BLEDevice central = BLE.central();
+  // --- menține WiFi/MQTT active (fără a modifica implementarea ta) ---
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqtt.connected()) connectMQTT();
+    mqtt.loop();
+  }
 
-  if (central) {
-    Serial.print("Conectat la: ");
-    Serial.println(central.address());
+  // --- conexiune BLE către Nicla ---
+  if (!rpyConnected) {
+    scanAndConnectNicla();
+  } else if (!nicla.connected()) {
+    // s-a pierdut conexiunea
+    rpyConnected = false;
+    drawSearchingScreen();
+    BLE.scan();
+  }
 
-    showConnectedScreen();
-    delay(2000);
+  // --- când vin date noi din caracteristică (12 bytes: 3 float-uri) ---
+  if (rpyConnected && rpyChr.valueUpdated()) {
+    float buf[3];
+    int n = rpyChr.readValue((uint8_t*)buf, sizeof(buf));
+    if (n == sizeof(buf)) {
+      float roll = buf[0];
+      float pitch = buf[1];
+      float yaw = buf[2];
 
-    showPromptScreen();
+      // debug serial
+      Serial.print("RX rpy = ");
+      Serial.print(roll); Serial.print(',');
+      Serial.print(pitch); Serial.print(',');
+      Serial.println(yaw);
 
-    while (central.connected()) {
-      if (textCharacteristic.written()) {
-        int len = textCharacteristic.valueLength();
-        const uint8_t* val = textCharacteristic.value();
+      // update TFT ~20 Hz
+      unsigned long now = millis();
+      if (now - lastDraw > 50) {
+        drawRPY(roll, pitch, yaw);
+        lastDraw = now;
+      }
 
-        String msg = "";
-        for (int i = 0; i < len; i++) {
-          msg += (char)val[i];
-        }
-
-        Serial.print("Primit: ");
-        Serial.println(msg);
-
-        // actualizează caracter mare + log
-        showMainChar(msg);
-        textLog += msg;
-        updateLogBox();
+      // publish MQTT ~5 Hz
+      static unsigned long lastMQTT = 0;
+      if (now - lastMQTT > 2000) {
+        mqttPublishRPY(roll, pitch, yaw);
+        lastMQTT = now;
       }
     }
-
-    Serial.println("Deconectat!");
-    textLog = ""; // reset log
-    showStartupScreen();
   }
+
+  // BLE housekeeping
+  BLE.poll();
 }
